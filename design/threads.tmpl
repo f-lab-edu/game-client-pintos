@@ -26,14 +26,33 @@ FirstName LastName <email@domain.example>
 
 ---- DATA STRUCTURES ----
 
->> A1: Copy here the declaration of each new or changed `struct' or
->> `struct' member, global or static variable, `typedef', or
->> enumeration.  Identify the purpose of each in 25 words or less.
+struct sleep_thread
+  {
+    struct list_elem elem;
+    int64_t duration;
+    struct semaphore semaphore;
+  };
+
+// 현재 자고 있는 스레드 목록
+static struct list sleep_thread_list;
 
 ---- ALGORITHMS ----
 
 >> A2: Briefly describe what happens in a call to timer_sleep(),
 >> including the effects of the timer interrupt handler.
+--- timer_sleep() ---
+1. interrupt를 비활성시킵니다.
+2. sleep_thread 구조체를 heap에 생성합니다.
+3. sleep_thread 구조체를 초기화합니다.
+3-1. duration을 설정합니다.
+3-2. semaphore를 0으로 초기화합니다.
+5. thread_sleep_list 구조체를 sleep_thread_list에 추가합니다.
+7. semaphore를 감소시킵니다. (0으로 초기화했기 때문에 현재 스레드는 블록됩니다.)
+8. interrupt 설정을 이전으로 되돌립니다.
+--- timer interrupt handler ---
+9. 경과 시간이 초과된 노드의 semaphore를 증가시킵니다.
+--- timer_sleep() ---
+10. 블록 해제된 스레드에서 sleep_thread 구조체를 해제합니다.
 
 >> A3: What steps are taken to minimize the amount of time spent in
 >> the timer interrupt handler?
@@ -42,14 +61,18 @@ FirstName LastName <email@domain.example>
 
 >> A4: How are race conditions avoided when multiple threads call
 >> timer_sleep() simultaneously?
+lock을 사용해서 thread_sleep_list를 갱신할 때 리소스를 잠금니다.
 
 >> A5: How are race conditions avoided when a timer interrupt occurs
 >> during a call to timer_sleep()?
+interrupt를 비활성화시켜서 다른 timer interrupt가 발생하지 않도록 막습니다.
 
 ---- RATIONALE ----
 
 >> A6: Why did you choose this design?  In what ways is it superior to
 >> another design you considered?
+semaphore를 0으로 초기화하여 사용하면, 자연스럽게 해당 스레드를 블록시킬 수 있습니다.
+이를 통해 CPU 시간을 사용하지 않고 일정 시간동안 실행을 지연할 수 있습니다.
 
              PRIORITY SCHEDULING
              ===================
