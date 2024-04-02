@@ -7,6 +7,7 @@
 #include "threads/interrupt.h"
 #include "threads/synch.h"
 #include "threads/thread.h"
+#include "threads/malloc.h"
   
 /* See [8254] for hardware details of the 8254 timer chip. */
 
@@ -17,12 +18,22 @@
 #error TIMER_FREQ <= 1000 recommended
 #endif
 
+struct sleep_thread
+  {
+    struct list_elem elem;
+    struct thread* thread;
+    int64_t duration;
+    struct semaphore semaphore;
+  };
+
 /* Number of timer ticks since OS booted. */
 static int64_t ticks;
 
 /* Number of loops per timer tick.
    Initialized by timer_calibrate(). */
 static unsigned loops_per_tick;
+
+static struct list sleep_thread_list;
 
 static intr_handler_func timer_interrupt;
 static bool too_many_loops (unsigned loops);
@@ -37,6 +48,7 @@ timer_init (void)
 {
   pit_configure_channel (0, 2, TIMER_FREQ);
   intr_register_ext (0x20, timer_interrupt, "8254 Timer");
+  list_init(&sleep_thread_list);
 }
 
 /* Calibrates loops_per_tick, used to implement brief delays. */
@@ -89,11 +101,23 @@ timer_elapsed (int64_t then)
 void
 timer_sleep (int64_t ticks) 
 {
-  int64_t start = timer_ticks ();
+  enum intr_level old_level = intr_disable ();
 
-  ASSERT (intr_get_level () == INTR_ON);
-  while (timer_elapsed (start) < ticks) 
-    thread_yield ();
+  if (ticks > 0)
+    {
+      struct sleep_thread* sleeper = malloc (sizeof (struct sleep_thread));
+      sleeper->thread = thread_current();
+      sleeper->duration = ticks;
+  
+      list_push_back (&sleep_thread_list, &sleeper->elem);
+
+      sema_init (&sleeper->semaphore, 0);
+      sema_down (&sleeper->semaphore);
+
+      free (sleeper);
+    }
+
+  intr_set_level (old_level);
 }
 
 /* Sleeps for approximately MS milliseconds.  Interrupts must be
@@ -165,13 +189,30 @@ timer_print_stats (void)
 {
   printf ("Timer: %"PRId64" ticks\n", timer_ticks ());
 }
-
+
 /* Timer interrupt handler. */
 static void
 timer_interrupt (struct intr_frame *args UNUSED)
 {
   ticks++;
   thread_tick ();
+
+  struct list_elem* cursor = list_begin (&sleep_thread_list);
+
+  while (cursor != list_end (&sleep_thread_list))
+    {
+      struct sleep_thread* sleeper = list_entry (cursor, struct sleep_thread, elem);
+      --sleeper->duration;
+      if (sleeper->duration > 0)
+        {
+          cursor = list_next (cursor);
+        }
+      else
+        {
+          sema_up (&sleeper->semaphore);
+          cursor = list_remove (cursor);
+        }
+    }
 }
 
 /* Returns true if LOOPS iterations waits for more than one timer
