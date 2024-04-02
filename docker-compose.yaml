@@ -1,0 +1,14 @@
+version: '3.4'
+services:
+  dev:
+    image: thierrysans/pintos
+    container_name: pintos
+    volumes:
+      # same as '-v' option in docker
+      - .:/pintos
+    working_dir: /pintos
+    hostname: pintos
+    # same as '-it'
+    tty: true
+    # the container starts with bash
+    entrypoint: bash
