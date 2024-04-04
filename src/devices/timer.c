@@ -21,7 +21,6 @@
 struct sleep_thread
   {
     struct list_elem elem;
-    struct thread* thread;
     int64_t duration;
     struct semaphore semaphore;
   };
@@ -34,6 +33,7 @@ static int64_t ticks;
 static unsigned loops_per_tick;
 
 static struct list sleep_thread_list;
+static struct lock sleep_thread_lock;
 
 static intr_handler_func timer_interrupt;
 static bool too_many_loops (unsigned loops);
@@ -48,7 +48,8 @@ timer_init (void)
 {
   pit_configure_channel (0, 2, TIMER_FREQ);
   intr_register_ext (0x20, timer_interrupt, "8254 Timer");
-  list_init(&sleep_thread_list);
+  list_init (&sleep_thread_list);
+  lock_init (&sleep_thread_lock);
 }
 
 /* Calibrates loops_per_tick, used to implement brief delays. */
@@ -101,23 +102,25 @@ timer_elapsed (int64_t then)
 void
 timer_sleep (int64_t ticks) 
 {
-  enum intr_level old_level = intr_disable ();
-
   if (ticks > 0)
     {
+      enum intr_level old_level = intr_disable();
+
       struct sleep_thread* sleeper = malloc (sizeof (struct sleep_thread));
-      sleeper->thread = thread_current();
       sleeper->duration = ticks;
-  
-      list_push_back (&sleep_thread_list, &sleeper->elem);
 
       sema_init (&sleeper->semaphore, 0);
+  
+      lock_acquire (&sleep_thread_lock);
+      list_push_back (&sleep_thread_list, &sleeper->elem);
+      lock_release (&sleep_thread_lock);
+
       sema_down (&sleeper->semaphore);
 
       free (sleeper);
-    }
 
-  intr_set_level (old_level);
+      intr_set_level(old_level);
+    }
 }
 
 /* Sleeps for approximately MS milliseconds.  Interrupts must be
@@ -202,15 +205,17 @@ timer_interrupt (struct intr_frame *args UNUSED)
   while (cursor != list_end (&sleep_thread_list))
     {
       struct sleep_thread* sleeper = list_entry (cursor, struct sleep_thread, elem);
+
       --sleeper->duration;
+      
       if (sleeper->duration > 0)
         {
           cursor = list_next (cursor);
         }
       else
         {
-          sema_up (&sleeper->semaphore);
           cursor = list_remove (cursor);
+          sema_up (&sleeper->semaphore);
         }
     }
 }
