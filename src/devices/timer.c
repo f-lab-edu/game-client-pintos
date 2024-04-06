@@ -21,7 +21,8 @@
 struct sleep_thread
   {
     struct list_elem elem;
-    int64_t duration;
+    struct thread* owner;
+    int64_t end_ticks;
     struct semaphore semaphore;
   };
 
@@ -34,12 +35,15 @@ static unsigned loops_per_tick;
 
 static struct list sleep_thread_list;
 static struct lock sleep_thread_lock;
+static list_less_func sleep_thread_priority;
 
 static intr_handler_func timer_interrupt;
 static bool too_many_loops (unsigned loops);
 static void busy_wait (int64_t loops);
 static void real_time_sleep (int64_t num, int32_t denom);
 static void real_time_delay (int64_t num, int32_t denom);
+
+
 
 /* Sets up the timer to interrupt TIMER_FREQ times per second,
    and registers the corresponding interrupt. */
@@ -104,24 +108,30 @@ timer_sleep (int64_t ticks)
 {
   if (ticks > 0)
     {
-      enum intr_level old_level = intr_disable();
+      struct sleep_thread sleeper;
+      sleeper.owner = thread_current ();
+      sleeper.end_ticks = timer_ticks() + ticks;
 
-      struct sleep_thread* sleeper = malloc (sizeof (struct sleep_thread));
-      sleeper->duration = ticks;
+      ASSERT (intr_get_level () == INTR_ON);
 
-      sema_init (&sleeper->semaphore, 0);
-  
+      sema_init (&sleeper.semaphore, 0);
       lock_acquire (&sleep_thread_lock);
-      list_push_back (&sleep_thread_list, &sleeper->elem);
+      list_push_back (&sleep_thread_list, &sleeper.elem);
       lock_release (&sleep_thread_lock);
-
-      sema_down (&sleeper->semaphore);
-
-      free (sleeper);
-
-      intr_set_level(old_level);
+      sema_down (&sleeper.semaphore);
     }
 }
+
+static bool
+sleep_thread_priority (const struct list_elem *a,
+                       const struct list_elem *b,
+                       void *aux UNUSED)
+{
+  const struct sleep_thread* left = list_entry (a, struct sleep_thread, elem);
+  const struct sleep_thread* right = list_entry (b, struct sleep_thread, elem);
+  return left->owner->priority > right->owner->priority;
+}
+
 
 /* Sleeps for approximately MS milliseconds.  Interrupts must be
    turned on. */
@@ -200,22 +210,25 @@ timer_interrupt (struct intr_frame *args UNUSED)
   ticks++;
   thread_tick ();
 
-  struct list_elem* cursor = list_begin (&sleep_thread_list);
-
-  while (cursor != list_end (&sleep_thread_list))
+  if (!list_empty (&sleep_thread_list))
     {
-      struct sleep_thread* sleeper = list_entry (cursor, struct sleep_thread, elem);
+      list_sort (&sleep_thread_list, sleep_thread_priority, NULL);
 
-      --sleeper->duration;
+      struct list_elem* cursor = list_begin (&sleep_thread_list);
       
-      if (sleeper->duration > 0)
+      while (cursor != list_end (&sleep_thread_list))
         {
-          cursor = list_next (cursor);
-        }
-      else
-        {
-          cursor = list_remove (cursor);
-          sema_up (&sleeper->semaphore);
+          struct sleep_thread* sleeper = list_entry (cursor, struct sleep_thread, elem);
+          
+          if (sleeper->end_ticks > ticks)
+            {
+              cursor = list_next (cursor);
+            }
+          else
+            {
+              cursor = list_remove (cursor);
+              sema_up (&sleeper->semaphore);
+            }
         }
     }
 }
