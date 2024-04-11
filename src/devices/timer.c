@@ -35,7 +35,6 @@ static unsigned loops_per_tick;
 
 static struct list sleep_thread_list;
 static struct lock sleep_thread_lock;
-static list_less_func sleep_thread_priority;
 
 static intr_handler_func timer_interrupt;
 static bool too_many_loops (unsigned loops);
@@ -122,17 +121,6 @@ timer_sleep (int64_t ticks)
     }
 }
 
-static bool
-sleep_thread_priority (const struct list_elem *a,
-                       const struct list_elem *b,
-                       void *aux UNUSED)
-{
-  const struct sleep_thread* left = list_entry (a, struct sleep_thread, elem);
-  const struct sleep_thread* right = list_entry (b, struct sleep_thread, elem);
-  return left->owner->priority > right->owner->priority;
-}
-
-
 /* Sleeps for approximately MS milliseconds.  Interrupts must be
    turned on. */
 void
@@ -212,8 +200,6 @@ timer_interrupt (struct intr_frame *args UNUSED)
 
   if (!list_empty (&sleep_thread_list))
     {
-      list_sort (&sleep_thread_list, sleep_thread_priority, NULL);
-
       struct list_elem* cursor = list_begin (&sleep_thread_list);
       
       while (cursor != list_end (&sleep_thread_list))
