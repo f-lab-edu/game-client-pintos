@@ -68,7 +68,7 @@ sema_down (struct semaphore *sema)
   old_level = intr_disable ();
   while (sema->value == 0) 
     {
-      list_push_back (&sema->waiters, &thread_current ()->elem);
+      list_insert_ordered (&sema->waiters, &thread_current ()->elem, thread_priority_greater, NULL);
       thread_block ();
     }
   sema->value--;
@@ -109,19 +109,22 @@ void
 sema_up (struct semaphore *sema) 
 {
   enum intr_level old_level;
+  struct thread *awoke_thread = thread_current ();
 
   ASSERT (sema != NULL);
 
   old_level = intr_disable ();
   if (!list_empty (&sema->waiters))
     {
-      struct list_elem *next = list_max (&sema->waiters, thread_priority_greater, NULL);
-      list_remove (next);
-      thread_unblock (list_entry (next, struct thread, elem));
+      awoke_thread = list_entry (list_pop_front (&sema->waiters), struct thread, elem);
+      thread_unblock (awoke_thread);
     }
 
   sema->value++;
   intr_set_level (old_level);
+
+  if (!intr_context () && thread_current ()->priority < awoke_thread->priority)
+    thread_yield ();
 }
 
 static void sema_test_helper (void *sema_);
@@ -255,7 +258,10 @@ struct semaphore_elem
   {
     struct list_elem elem;              /* List element. */
     struct semaphore semaphore;         /* This semaphore. */
+    struct thread *holder;
   };
+
+static list_less_func semaphore_elem_greater;
 
 /* Initializes condition variable COND.  A condition variable
    allows one piece of code to signal a condition and cooperating
@@ -298,11 +304,20 @@ cond_wait (struct condition *cond, struct lock *lock)
   ASSERT (!intr_context ());
   ASSERT (lock_held_by_current_thread (lock));
   
+  waiter.holder = thread_current ();
   sema_init (&waiter.semaphore, 0);
-  list_push_back (&cond->waiters, &waiter.elem);
+  list_insert_ordered (&cond->waiters, &waiter.elem, semaphore_elem_greater, NULL);
   lock_release (lock);
   sema_down (&waiter.semaphore);
   lock_acquire (lock);
+}
+
+bool
+semaphore_elem_greater (const struct list_elem *a, const struct list_elem *b, void *AUX UNUSED)
+{
+  struct semaphore_elem *x = list_entry (a, struct semaphore_elem, elem);
+  struct semaphore_elem *y = list_entry (b, struct semaphore_elem, elem);
+  return x->holder->priority > y->holder->priority;
 }
 
 /* If any threads are waiting on COND (protected by LOCK), then
