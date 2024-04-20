@@ -59,6 +59,8 @@ static unsigned thread_ticks;   /* # of timer ticks since last yield. */
    Controlled by kernel command-line option "-o mlfqs". */
 bool thread_mlfqs;
 
+static void donate_priority (struct thread *, int priority, int level);
+
 static void kernel_thread (thread_func *, void *aux);
 
 static void idle (void *aux UNUSED);
@@ -338,14 +340,16 @@ thread_foreach (thread_action_func *func, void *aux)
 void
 thread_set_priority (int new_priority) 
 {
-  thread_current ()->priority = new_priority;
-  
+  if (list_empty (&thread_current ()->donation_list))
+    thread_current ()->priority = new_priority;
+  thread_current ()->captured_priority = new_priority;
+
   if (!list_empty(&ready_list))
     {
       struct thread *preemptible = list_entry (list_front (&ready_list), struct thread, elem);
-      if (preemptible->priority > new_priority)
+      if (preemptible->priority > thread_current ()->priority)
         thread_yield();
-    }
+    } 
 }
 
 /* Returns the current thread's priority. */
@@ -355,12 +359,51 @@ thread_get_priority (void)
   return thread_current ()->priority;
 }
 
+void
+thread_donate_priority (struct thread *t)
+{
+  ASSERT (t->priority < thread_current ()->priority);
+  ASSERT (!intr_context ());
+
+  enum intr_level old_level = intr_disable ();
+
+  // if (list_empty (&t->contributors))
+  //   t->captured_priority = t->priority;
+  
+  donate_priority (t, thread_current ()->priority, 0);
+  list_push_back (&t->donation_list, &thread_current ()->donation_elem);
+  thread_current ()->donated_to = t;
+  
+  list_sort (&ready_list, thread_priority_greater, NULL);
+
+  intr_set_level (old_level);
+}
+
+void
+donate_priority (struct thread *t, int priority, int level)
+{
+  if (level < PRI_DONATION_MAX)
+    {
+      t->priority = priority;
+      if (t->donated_to != NULL)
+        donate_priority (t->donated_to, priority, level + 1);
+    }
+}
+
 bool
 thread_priority_greater(const struct list_elem *a, const struct list_elem *b, void *aux UNUSED)
 {
   const struct thread *x = list_entry (a, struct thread, elem);
   const struct thread *y = list_entry (b, struct thread, elem);
   return x->priority > y->priority;
+}
+
+bool
+thread_priority_less(const struct list_elem *a, const struct list_elem *b, void *aux UNUSED)
+{
+  const struct thread *x = list_entry (a, struct thread, elem);
+  const struct thread *y = list_entry (b, struct thread, elem);
+  return x->priority < y->priority;
 }
 
 /* Sets the current thread's nice value to NICE. */
@@ -480,6 +523,9 @@ init_thread (struct thread *t, const char *name, int priority)
   strlcpy (t->name, name, sizeof t->name);
   t->stack = (uint8_t *) t + PGSIZE;
   t->priority = priority;
+  t->captured_priority = priority;
+  t->donated_to = NULL;
+  list_init (&t->donation_list);
   t->magic = THREAD_MAGIC;
 
   old_level = intr_disable ();

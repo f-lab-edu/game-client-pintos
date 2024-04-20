@@ -68,7 +68,7 @@ sema_down (struct semaphore *sema)
   old_level = intr_disable ();
   while (sema->value == 0) 
     {
-      list_insert_ordered (&sema->waiters, &thread_current ()->elem, thread_priority_greater, NULL);
+      list_push_back (&sema->waiters, &thread_current ()->elem);
       thread_block ();
     }
   sema->value--;
@@ -116,7 +116,9 @@ sema_up (struct semaphore *sema)
   old_level = intr_disable ();
   if (!list_empty (&sema->waiters))
     {
-      awoke_thread = list_entry (list_pop_front (&sema->waiters), struct thread, elem);
+      struct list_elem *elem = list_max (&sema->waiters, thread_priority_less, NULL);
+      list_remove (elem);
+      awoke_thread = list_entry (elem, struct thread, elem);
       thread_unblock (awoke_thread);
     }
 
@@ -203,7 +205,16 @@ lock_acquire (struct lock *lock)
   ASSERT (!intr_context ());
   ASSERT (!lock_held_by_current_thread (lock));
 
-  sema_down (&lock->semaphore);
+  if (!sema_try_down (&lock->semaphore))
+    {
+      struct thread *t = lock->holder;
+
+      if (thread_get_priority () > t->priority)
+        thread_donate_priority (t);
+
+      sema_down (&lock->semaphore);
+    }
+
   lock->holder = thread_current ();
 }
 
@@ -237,6 +248,27 @@ lock_release (struct lock *lock)
 {
   ASSERT (lock != NULL);
   ASSERT (lock_held_by_current_thread (lock));
+  
+  struct thread *current = thread_current ();
+
+  for (struct list_elem *waiter = list_begin (&lock->semaphore.waiters); waiter != list_end (&lock->semaphore.waiters); waiter = list_next (waiter))
+    {
+      struct thread *t = list_entry (waiter, struct thread, elem);
+      
+      for (struct list_elem *donor = list_begin (&current->donation_list); donor != list_end (&current->donation_list); donor = list_next (donor))
+        {
+          if (t == list_entry (donor, struct thread, donation_elem))
+            {
+              list_remove (donor);
+              break;
+            }
+        }
+    }
+
+  if (!list_empty (&current->donation_list))
+    current->priority = list_entry (list_max(&current->donation_list, thread_priority_less, NULL), struct thread, donation_elem)->priority;
+  else
+    current->priority = current->captured_priority;
 
   lock->holder = NULL;
   sema_up (&lock->semaphore);
