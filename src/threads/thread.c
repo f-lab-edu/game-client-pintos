@@ -366,9 +366,6 @@ thread_donate_priority (struct thread *t)
   ASSERT (!intr_context ());
 
   enum intr_level old_level = intr_disable ();
-
-  // if (list_empty (&t->contributors))
-  //   t->captured_priority = t->priority;
   
   donate_priority (t, thread_current ()->priority, 0);
   list_push_back (&t->donation_list, &thread_current ()->donation_elem);
