@@ -1,0 +1,30 @@
+{
+    "files.associations": {
+        "array": "c",
+        "initializer_list": "c",
+        "limits": "c",
+        "type_traits": "c",
+        "random": "c",
+        "typeinfo": "c",
+        "palloc.h": "c",
+        "optional": "c",
+        "system_error": "c",
+        "functional": "c",
+        "tuple": "c",
+        "utility": "c",
+        "string_view": "c",
+        "stdio.h": "c",
+        "string.h": "c",
+        "file.h": "c",
+        "gdt.h": "c",
+        "string": "c",
+        "syscall-nr.h": "c",
+        "hash.h": "c",
+        "interrupt.h": "c",
+        "thread.h": "c",
+        "list.h": "c",
+        "malloc.h": "c",
+        "pagedir.h": "c",
+        "process.h": "c"
+    }
+}
