@@ -23,7 +23,7 @@ struct sleep_thread
     struct list_elem elem;
     struct thread* owner;
     int64_t end_ticks;
-    struct semaphore semaphore;
+    struct semaphore alarm;
   };
 
 /* Number of timer ticks since OS booted. */
@@ -34,7 +34,7 @@ static int64_t ticks;
 static unsigned loops_per_tick;
 
 static struct list sleep_thread_list;
-static struct lock sleep_thread_lock;
+static list_less_func sleep_thread_less;
 
 static intr_handler_func timer_interrupt;
 static bool too_many_loops (unsigned loops);
@@ -52,7 +52,6 @@ timer_init (void)
   pit_configure_channel (0, 2, TIMER_FREQ);
   intr_register_ext (0x20, timer_interrupt, "8254 Timer");
   list_init (&sleep_thread_list);
-  lock_init (&sleep_thread_lock);
 }
 
 /* Calibrates loops_per_tick, used to implement brief delays. */
@@ -110,14 +109,14 @@ timer_sleep (int64_t ticks)
       struct sleep_thread sleeper;
       sleeper.owner = thread_current ();
       sleeper.end_ticks = timer_ticks() + ticks;
+      
+      int old_level = intr_disable ();
 
-      ASSERT (intr_get_level () == INTR_ON);
+      sema_init (&sleeper.alarm, 0);
+      list_insert_ordered (&sleep_thread_list, &sleeper.elem, sleep_thread_less, NULL);
+      sema_down (&sleeper.alarm);
 
-      sema_init (&sleeper.semaphore, 0);
-      lock_acquire (&sleep_thread_lock);
-      list_push_back (&sleep_thread_list, &sleeper.elem);
-      lock_release (&sleep_thread_lock);
-      sema_down (&sleeper.semaphore);
+      intr_set_level (old_level);
     }
 }
 
@@ -207,16 +206,20 @@ timer_interrupt (struct intr_frame *args UNUSED)
           struct sleep_thread* sleeper = list_entry (cursor, struct sleep_thread, elem);
           
           if (sleeper->end_ticks > ticks)
-            {
-              cursor = list_next (cursor);
-            }
-          else
-            {
-              cursor = list_remove (cursor);
-              sema_up (&sleeper->semaphore);
-            }
+            break;
+
+          cursor = list_remove (cursor);
+          sema_up (&sleeper->alarm);
         }
     }
+}
+
+static bool
+sleep_thread_less (const struct list_elem *a, const struct list_elem *b, void *aux UNUSED)
+{
+  struct sleep_thread *x = list_entry (a, struct sleep_thread, elem);
+  struct sleep_thread *y = list_entry (b, struct sleep_thread, elem);
+  return x->end_ticks < y->end_ticks;
 }
 
 /* Returns true if LOOPS iterations waits for more than one timer
