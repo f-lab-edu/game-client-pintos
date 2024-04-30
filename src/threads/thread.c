@@ -201,6 +201,9 @@ thread_create (const char *name, int priority,
   /* Add to run queue. */
   thread_unblock (t);
 
+  if (priority > thread_current ()->priority)
+    thread_yield ();
+
   return tid;
 }
 
@@ -237,7 +240,7 @@ thread_unblock (struct thread *t)
 
   old_level = intr_disable ();
   ASSERT (t->status == THREAD_BLOCKED);
-  list_push_back (&ready_list, &t->elem);
+  list_insert_ordered (&ready_list, &t->elem, thread_priority_greater, NULL);
   t->status = THREAD_READY;
   intr_set_level (old_level);
 }
@@ -308,7 +311,7 @@ thread_yield (void)
 
   old_level = intr_disable ();
   if (cur != idle_thread) 
-    list_push_back (&ready_list, &cur->elem);
+    list_insert_ordered (&ready_list, &cur->elem, thread_priority_greater, NULL);
   cur->status = THREAD_READY;
   schedule ();
   intr_set_level (old_level);
@@ -336,6 +339,13 @@ void
 thread_set_priority (int new_priority) 
 {
   thread_current ()->priority = new_priority;
+  
+  if (!list_empty(&ready_list))
+    {
+      struct thread *preemptible = list_entry (list_front (&ready_list), struct thread, elem);
+      if (preemptible->priority > new_priority)
+        thread_yield();
+    }
 }
 
 /* Returns the current thread's priority. */
@@ -343,6 +353,14 @@ int
 thread_get_priority (void) 
 {
   return thread_current ()->priority;
+}
+
+bool
+thread_priority_greater(const struct list_elem *a, const struct list_elem *b, void *aux UNUSED)
+{
+  const struct thread *x = list_entry (a, struct thread, elem);
+  const struct thread *y = list_entry (b, struct thread, elem);
+  return x->priority > y->priority;
 }
 
 /* Sets the current thread's nice value to NICE. */

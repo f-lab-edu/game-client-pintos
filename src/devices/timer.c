@@ -7,6 +7,7 @@
 #include "threads/interrupt.h"
 #include "threads/synch.h"
 #include "threads/thread.h"
+#include "threads/malloc.h"
   
 /* See [8254] for hardware details of the 8254 timer chip. */
 
@@ -17,6 +18,14 @@
 #error TIMER_FREQ <= 1000 recommended
 #endif
 
+struct sleep_thread
+  {
+    struct list_elem elem;
+    struct thread* owner;
+    int64_t end_ticks;
+    struct semaphore semaphore;
+  };
+
 /* Number of timer ticks since OS booted. */
 static int64_t ticks;
 
@@ -24,11 +33,16 @@ static int64_t ticks;
    Initialized by timer_calibrate(). */
 static unsigned loops_per_tick;
 
+static struct list sleep_thread_list;
+static struct lock sleep_thread_lock;
+
 static intr_handler_func timer_interrupt;
 static bool too_many_loops (unsigned loops);
 static void busy_wait (int64_t loops);
 static void real_time_sleep (int64_t num, int32_t denom);
 static void real_time_delay (int64_t num, int32_t denom);
+
+
 
 /* Sets up the timer to interrupt TIMER_FREQ times per second,
    and registers the corresponding interrupt. */
@@ -37,6 +51,8 @@ timer_init (void)
 {
   pit_configure_channel (0, 2, TIMER_FREQ);
   intr_register_ext (0x20, timer_interrupt, "8254 Timer");
+  list_init (&sleep_thread_list);
+  lock_init (&sleep_thread_lock);
 }
 
 /* Calibrates loops_per_tick, used to implement brief delays. */
@@ -89,11 +105,20 @@ timer_elapsed (int64_t then)
 void
 timer_sleep (int64_t ticks) 
 {
-  int64_t start = timer_ticks ();
+  if (ticks > 0)
+    {
+      struct sleep_thread sleeper;
+      sleeper.owner = thread_current ();
+      sleeper.end_ticks = timer_ticks() + ticks;
 
-  ASSERT (intr_get_level () == INTR_ON);
-  while (timer_elapsed (start) < ticks) 
-    thread_yield ();
+      ASSERT (intr_get_level () == INTR_ON);
+
+      sema_init (&sleeper.semaphore, 0);
+      lock_acquire (&sleep_thread_lock);
+      list_push_back (&sleep_thread_list, &sleeper.elem);
+      lock_release (&sleep_thread_lock);
+      sema_down (&sleeper.semaphore);
+    }
 }
 
 /* Sleeps for approximately MS milliseconds.  Interrupts must be
@@ -165,13 +190,33 @@ timer_print_stats (void)
 {
   printf ("Timer: %"PRId64" ticks\n", timer_ticks ());
 }
-
+
 /* Timer interrupt handler. */
 static void
 timer_interrupt (struct intr_frame *args UNUSED)
 {
   ticks++;
   thread_tick ();
+
+  if (!list_empty (&sleep_thread_list))
+    {
+      struct list_elem* cursor = list_begin (&sleep_thread_list);
+      
+      while (cursor != list_end (&sleep_thread_list))
+        {
+          struct sleep_thread* sleeper = list_entry (cursor, struct sleep_thread, elem);
+          
+          if (sleeper->end_ticks > ticks)
+            {
+              cursor = list_next (cursor);
+            }
+          else
+            {
+              cursor = list_remove (cursor);
+              sema_up (&sleeper->semaphore);
+            }
+        }
+    }
 }
 
 /* Returns true if LOOPS iterations waits for more than one timer
