@@ -17,16 +17,42 @@
 #include "threads/palloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#include "threads/malloc.h"
+
+#define USER_STACK (PHYS_BASE - 4)
+#define ARG_MAX 32
+#define DELIMITER " "
+
+static struct list process_list;
+
+struct thread_params
+  {
+    char *name;
+    char *args;
+    tid_t parent;
+    struct semaphore started;
+    bool success;
+  };
 
 static thread_func start_process NO_RETURN;
+static void push_stack (void **esp, const void *value, size_t size);
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
+static void init_process (struct process *p, const char *name, tid_t parent);
+static void remove_process (struct process *p);
+static struct process *find_process (tid_t tid);
+
+void
+process_init (void)
+{
+  list_init (&process_list);
+}
 
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
    before process_execute() returns.  Returns the new process's
    thread id, or TID_ERROR if the thread cannot be created. */
 tid_t
-process_execute (const char *file_name) 
+process_execute (const char *file_name)
 {
   char *fn_copy;
   tid_t tid;
@@ -39,31 +65,99 @@ process_execute (const char *file_name)
   strlcpy (fn_copy, file_name, PGSIZE);
 
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
+  char *args = NULL;
+  char *process_name = strtok_r ((char*)fn_copy, DELIMITER, &args);
+
+  /* Setup thread params for start_process function. */
+  struct thread_params params;
+  params.name = process_name;
+  params.args = args;
+  params.parent = thread_current ()->tid;
+  sema_init (&params.started, 0);
+  params.success = false;
+  
+  tid = thread_create (process_name, PRI_DEFAULT, start_process, &params);
   if (tid == TID_ERROR)
-    palloc_free_page (fn_copy); 
+      palloc_free_page (fn_copy);
+  else
+    {
+      /* Wait for process status is executable */
+      sema_down (&params.started);
+
+      if (!params.success)
+        tid = TID_ERROR;
+    }
+
   return tid;
 }
 
 /* A thread function that loads a user process and starts it
    running. */
 static void
-start_process (void *file_name_)
+start_process (void *aux)
 {
-  char *file_name = file_name_;
+  struct thread_params *params = (struct thread_params *)aux; 
+
   struct intr_frame if_;
   bool success;
 
+  int argc = 0;
+  char *argv[ARG_MAX];
+
+  memset (argv, 0, sizeof argv);
+
+  argv[argc++] = params->name;
+
+  /* Parse command. */
+  char *token = strtok_r (NULL, DELIMITER, &params->args);
+  while (token != NULL)
+    {
+      argv[argc++] = token;
+      token = strtok_r (NULL, DELIMITER, &params->args);
+    }
+  
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
-  success = load (file_name, &if_.eip, &if_.esp);
+  success = load (params->name, &if_.eip, &if_.esp);
+
+  if (success)
+    {
+      /* Push argument value */
+      for (int i = argc - 1; i >= 0; --i)
+        {
+          push_stack (&if_.esp, argv[i], strlen (argv[i]) + 1);
+          argv[i] = if_.esp;
+        }
+
+      /* Push argument address */
+      for (int i = argc; i >= 0; --i)
+        push_stack (&if_.esp, argv + i, sizeof (char*));
+      /* Push argument vector address  */
+      void *argument_vector = if_.esp;
+      push_stack (&if_.esp, &argument_vector, sizeof (void*));
+
+      /* Push argument count */
+      push_stack (&if_.esp, &argc, sizeof argc);
+
+      /* Push return address */
+      void *return_address = NULL;
+      push_stack (&if_.esp, &return_address, sizeof return_address);
+
+      /* Add process data structure. */
+      struct process *p = (struct process *)malloc (sizeof (struct process));
+      init_process (p, params->name, params->parent);
+    }
+
+  palloc_free_page (params->name);
+
+  params->success = success;
+  sema_up (&params->started);
 
   /* If load failed, quit. */
-  palloc_free_page (file_name);
-  if (!success) 
+  if (!success)
     thread_exit ();
 
   /* Start the user process by simulating a return from an
@@ -76,6 +170,45 @@ start_process (void *file_name_)
   NOT_REACHED ();
 }
 
+static void
+push_stack (void **esp, const void *value, size_t size)
+{
+  *esp -= size;
+  *esp -= (uintptr_t)(*esp) % 4;
+  memcpy (*esp, value, size);
+}
+
+static void
+init_process (struct process *p, const char *name, tid_t parent)
+{
+  p->tid = thread_current ()->tid;
+      
+  sema_init (&p->running, 0);
+  p->exit_status = 0;
+
+  p->parent = parent;
+
+  p->executable = filesys_open(name);
+  if (p->executable)
+    /* Deny writing to executing program. */
+    file_deny_write (p->executable);
+
+  memset (p->open_files, 0, sizeof p->open_files);
+
+  enum intr_level old_level = intr_disable ();
+  list_push_back (&process_list, &p->elem);
+  intr_set_level (old_level);
+}
+
+static void
+remove_process (struct process *p)
+{
+  enum intr_level old_level = intr_disable ();
+  list_remove (&p->elem);
+  free (p);
+  intr_set_level (old_level);
+}
+
 /* Waits for thread TID to die and returns its exit status.  If
    it was terminated by the kernel (i.e. killed due to an
    exception), returns -1.  If TID is invalid or if it was not a
@@ -86,9 +219,19 @@ start_process (void *file_name_)
    This function will be implemented in problem 2-2.  For now, it
    does nothing. */
 int
-process_wait (tid_t child_tid UNUSED) 
+process_wait (tid_t child_tid) 
 {
-  return -1;
+  struct process *child = find_process (child_tid);
+  int exit_status = -1;
+
+  if (child != NULL && child->parent == thread_current ()->tid)
+    {
+      sema_down (&child->running);
+      exit_status = child->exit_status;
+      remove_process (child);
+    }
+
+  return exit_status;
 }
 
 /* Free the current process's resources. */
@@ -98,6 +241,16 @@ process_exit (void)
   struct thread *cur = thread_current ();
   uint32_t *pd;
 
+  struct process *process = find_process (cur->tid);
+  if (process != NULL)
+    {
+      file_close (process->executable);
+      for (int fd = STDOUT_FILENO + 1; fd < NOFILE; ++fd)
+        file_close (process->open_files[fd]);
+
+      sema_up (&process->running);
+    }
+  
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
   pd = cur->pagedir;
@@ -131,7 +284,7 @@ process_activate (void)
      interrupts. */
   tss_update ();
 }
-
+
 /* We load ELF binaries.  The following definitions are taken
    from the ELF specification, [ELF1], more-or-less verbatim.  */
 
@@ -219,15 +372,13 @@ load (const char *file_name, void (**eip) (void), void **esp)
   t->pagedir = pagedir_create ();
   if (t->pagedir == NULL) 
     goto done;
+
   process_activate ();
 
   /* Open executable file. */
   file = filesys_open (file_name);
   if (file == NULL) 
-    {
-      printf ("load: %s: open failed\n", file_name);
-      goto done; 
-    }
+    goto done; 
 
   /* Read and verify executable header. */
   if (file_read (file, &ehdr, sizeof ehdr) != sizeof ehdr
@@ -237,10 +388,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
       || ehdr.e_version != 1
       || ehdr.e_phentsize != sizeof (struct Elf32_Phdr)
       || ehdr.e_phnum > 1024) 
-    {
-      printf ("load: %s: error loading executable\n", file_name);
       goto done; 
-    }
 
   /* Read program headers. */
   file_ofs = ehdr.e_phoff;
@@ -249,11 +397,13 @@ load (const char *file_name, void (**eip) (void), void **esp)
       struct Elf32_Phdr phdr;
 
       if (file_ofs < 0 || file_ofs > file_length (file))
-        goto done;
+          goto done;
+
       file_seek (file, file_ofs);
 
       if (file_read (file, &phdr, sizeof phdr) != sizeof phdr)
-        goto done;
+          goto done;
+
       file_ofs += sizeof phdr;
       switch (phdr.p_type) 
         {
@@ -297,6 +447,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
             }
           else
             goto done;
+
           break;
         }
     }
@@ -437,7 +588,7 @@ setup_stack (void **esp)
     {
       success = install_page (((uint8_t *) PHYS_BASE) - PGSIZE, kpage, true);
       if (success)
-        *esp = PHYS_BASE;
+        *esp = USER_STACK;
       else
         palloc_free_page (kpage);
     }
@@ -462,4 +613,30 @@ install_page (void *upage, void *kpage, bool writable)
      address, then map our page there. */
   return (pagedir_get_page (t->pagedir, upage) == NULL
           && pagedir_set_page (t->pagedir, upage, kpage, writable));
+}
+
+struct process *
+process_current (void)
+{
+  return find_process (thread_current ()->tid);
+}
+
+bool
+process_has_child (tid_t tid)
+{
+  struct process *p = find_process (tid);
+  return p != NULL && p->parent == thread_current ()->tid;
+}
+
+static struct process *
+find_process (tid_t tid)
+{
+  for (struct list_elem *cursor = list_begin (&process_list); cursor != list_end (&process_list); cursor = list_next (cursor))
+    {
+      struct process *p = list_entry (cursor, struct process, elem);
+      if (p->tid == tid)
+        return p;
+    }
+  
+  return NULL;
 }
