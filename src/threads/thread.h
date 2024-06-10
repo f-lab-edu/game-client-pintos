@@ -2,6 +2,7 @@
 #define THREADS_THREAD_H
 
 #include <debug.h>
+#include <hash.h>
 #include <list.h>
 #include <stdint.h>
 #include "synch.h"
@@ -96,6 +97,9 @@ struct thread
     struct thread *donated_to;
     struct list donation_list;
     struct list_elem donation_elem;
+
+    void *esp;
+    struct hash page_table;
 
     struct list_elem allelem;           /* List element for all threads list. */
 

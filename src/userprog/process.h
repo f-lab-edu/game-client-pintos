@@ -4,6 +4,8 @@
 #include "threads/thread.h"
 
 #define NOFILE 128
+#define USER_STACK (PHYS_BASE - 4)
+#define STACK_MAX_SIZE 1024 * 1024
 
 struct process
   {

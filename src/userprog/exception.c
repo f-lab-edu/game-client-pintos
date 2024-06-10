@@ -6,13 +6,21 @@
 #include "userprog/process.h"
 #include "threads/interrupt.h"
 #include "threads/thread.h"
+#include "threads/vaddr.h"
+#include "threads/malloc.h"
+#include "vm/page.h"
+#include "vm/frame.h"
+#include "filesys/filesys.h"
 #include "pagedir.h"
+
 
 /* Number of page faults processed. */
 static long long page_fault_cnt;
 
 static void kill (struct intr_frame *);
 static void page_fault (struct intr_frame *);
+static bool within_user_stack (void *);
+static void grow_user_stack (struct thread *, void *);
 
 /* Registers handlers for interrupts that can be caused by user
    programs.
@@ -150,9 +158,93 @@ page_fault (struct intr_frame *f)
   not_present = (f->error_code & PF_P) == 0;
   write = (f->error_code & PF_W) != 0;
   user = (f->error_code & PF_U) != 0;
+  
+  struct thread *t = thread_current ();
+  void *page_address = pg_round_down (fault_addr);
+  struct page *p = page_table_lookup (&t->page_table, page_address);
 
-  /* To implement virtual memory, delete the rest of the function
-     body, and replace it with code that brings in the page to
-     which fault_addr refers. */
-   exit (-1);
+  if (p == NULL)
+    {
+      void *limit = t->esp - 32;
+      /* Check if the address is a user stack.  */
+      if (within_user_stack (fault_addr) && fault_addr > limit)
+        grow_user_stack (t, page_address);
+      else
+        exit (-1);
+    }
+  else
+    {
+      switch (p->segment)
+        {
+          case SEG_CODE:
+            {
+              void *frame = frame_table_get_frame ();
+
+              struct file *file = filesys_open (t->name);
+              off_t length = file_length (file);
+              size_t page_read_bytes = p->position + PGSIZE < file_length (file) ? PGSIZE : length - p->position;
+              size_t page_zero_bytes = PGSIZE - page_read_bytes;
+
+              bool success = true;
+
+              if (page_zero_bytes != PGSIZE)
+                {
+                  file_seek (file, p->position);
+
+                  if (file_read (file, frame, page_read_bytes) != (int) page_read_bytes ||
+                      !pagedir_set_page (t->pagedir, p->address, frame, p->writable))
+                        {
+                          printf ("code loading failed...\n");
+                          success = false;
+                        }
+
+                  file_close (file);
+                }
+
+              memset (frame + page_read_bytes, 0, page_zero_bytes);
+
+              if (!success)
+                {
+                  frame_table_free_frame (frame);
+                  exit (-1);
+                }
+            }
+            break;
+          case SEG_STACK:
+            {
+              /* TODO: Swap in */
+            }
+            break;
+        }
+    }
+}
+
+static bool
+within_user_stack (void *address)
+{
+  return address < PHYS_BASE && address >= PHYS_BASE - STACK_MAX_SIZE;
+}
+
+static void
+grow_user_stack (struct thread *t, void *virtual_address)
+{
+  while (pagedir_get_page (t->pagedir, virtual_address) == NULL)
+    {
+      void *frame = frame_table_get_frame ();
+      bool success = pagedir_set_page (t->pagedir, virtual_address, frame, true);
+      if (success)
+        {
+          struct page p;
+          p.address = virtual_address;
+          p.segment = SEG_STACK;
+          p.writable = true;
+          page_table_insert (&t->page_table, &p);
+          virtual_address += PGSIZE;
+        }
+      else
+        {
+          frame_table_free_frame (frame);
+          exit (-1);
+        }
+    }
 }
