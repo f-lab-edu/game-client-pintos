@@ -14,6 +14,7 @@
 #ifdef USERPROG
 #include "userprog/process.h"
 #endif
+#include "vm/page.h"
 
 /* Random value for struct thread's `magic' member.
    Used to detect stack overflow.  See the big comment at the top
@@ -59,6 +60,8 @@ static unsigned thread_ticks;   /* # of timer ticks since last yield. */
    Controlled by kernel command-line option "-o mlfqs". */
 bool thread_mlfqs;
 
+struct lock fs_lock;
+
 static void donate_priority (struct thread *, int priority, int level);
 
 static void kernel_thread (thread_func *, void *aux);
@@ -100,6 +103,8 @@ thread_init (void)
   init_thread (initial_thread, "main", PRI_DEFAULT);
   initial_thread->status = THREAD_RUNNING;
   initial_thread->tid = allocate_tid ();
+
+  lock_init (&fs_lock);
 }
 
 /* Starts preemptive thread scheduling by enabling interrupts.
@@ -290,6 +295,9 @@ thread_exit (void)
 #ifdef USERPROG
   process_exit ();
 #endif
+
+  if (fs_lock.holder == thread_current ())
+    lock_release (&fs_lock);
 
   /* Remove thread from all threads list, set our status to dying,
      and schedule another process.  That process will destroy us
@@ -524,6 +532,21 @@ init_thread (struct thread *t, const char *name, int priority)
   t->captured_priority = priority;
   t->donated_to = NULL;
   list_init (&t->donation_list);
+
+  sema_init (&t->finish, 0);
+  sema_init (&t->destroy, 0);
+
+  t->exit_status = 0;
+  t->executable = NULL;
+  memset (t->open_files, 0, sizeof t->open_files);
+
+  t->parent = NULL;
+  list_init (&t->child_list);
+
+  t->esp = NULL;
+
+  t->next_mapid = 0;
+  list_init (&t->mappings);
 
   t->magic = THREAD_MAGIC;
 

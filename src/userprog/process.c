@@ -19,17 +19,17 @@
 #include "threads/vaddr.h"
 #include "threads/malloc.h"
 
-#define USER_STACK (PHYS_BASE - 4)
+#include "vm/frame.h"
+#include "vm/page.h"
+
 #define ARG_MAX 32
 #define DELIMITER " "
-
-static struct list process_list;
 
 struct thread_params
   {
     char *name;
     char *args;
-    tid_t parent;
+    struct thread *parent;
     struct semaphore started;
     bool success;
   };
@@ -37,15 +37,7 @@ struct thread_params
 static thread_func start_process NO_RETURN;
 static void push_stack (void **esp, const void *value, size_t size);
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
-static void init_process (struct process *p, const char *name, tid_t parent);
-static void remove_process (struct process *p);
-static struct process *find_process (tid_t tid);
-
-void
-process_init (void)
-{
-  list_init (&process_list);
-}
+static void init_process (const char *name, struct thread *parent);
 
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
@@ -72,7 +64,7 @@ process_execute (const char *file_name)
   struct thread_params params;
   params.name = process_name;
   params.args = args;
-  params.parent = thread_current ()->tid;
+  params.parent = thread_current ();
   sema_init (&params.started, 0);
   params.success = false;
   
@@ -116,6 +108,9 @@ start_process (void *aux)
       token = strtok_r (NULL, DELIMITER, &params->args);
     }
   
+  /* Initialize supplemental page table. */
+  page_table_init (&thread_current ()->page_table);
+
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
@@ -146,9 +141,7 @@ start_process (void *aux)
       void *return_address = NULL;
       push_stack (&if_.esp, &return_address, sizeof return_address);
 
-      /* Add process data structure. */
-      struct process *p = (struct process *)malloc (sizeof (struct process));
-      init_process (p, params->name, params->parent);
+      init_process (params->name, params->parent);
     }
 
   palloc_free_page (params->name);
@@ -179,34 +172,17 @@ push_stack (void **esp, const void *value, size_t size)
 }
 
 static void
-init_process (struct process *p, const char *name, tid_t parent)
+init_process (const char *name, struct thread *parent)
 {
-  p->tid = thread_current ()->tid;
-      
-  sema_init (&p->running, 0);
-  p->exit_status = 0;
+  struct thread *t = thread_current ();
 
-  p->parent = parent;
+  t->parent = parent;
+  if (parent != NULL)
+    list_push_back (&parent->child_list, &t->child_elem);
 
-  p->executable = filesys_open(name);
-  if (p->executable)
+  if (t->executable)
     /* Deny writing to executing program. */
-    file_deny_write (p->executable);
-
-  memset (p->open_files, 0, sizeof p->open_files);
-
-  enum intr_level old_level = intr_disable ();
-  list_push_back (&process_list, &p->elem);
-  intr_set_level (old_level);
-}
-
-static void
-remove_process (struct process *p)
-{
-  enum intr_level old_level = intr_disable ();
-  list_remove (&p->elem);
-  free (p);
-  intr_set_level (old_level);
+    file_deny_write (t->executable);
 }
 
 /* Waits for thread TID to die and returns its exit status.  If
@@ -221,14 +197,26 @@ remove_process (struct process *p)
 int
 process_wait (tid_t child_tid) 
 {
-  struct process *child = find_process (child_tid);
+  struct thread *parent = thread_current ();
+  struct thread *child = NULL;
   int exit_status = -1;
 
-  if (child != NULL && child->parent == thread_current ()->tid)
+  for (struct list_elem *cursor = list_begin (&parent->child_list); cursor != list_end (&parent->child_list); cursor = list_next (cursor))
     {
-      sema_down (&child->running);
+      struct thread *t = list_entry (cursor, struct thread, child_elem);
+      if (t->tid == child_tid)
+        {
+          child = t;
+          break;
+        }
+    }
+
+  // child process가 있으면서 아직 parent process에서 exit_status를 읽지 않은 경우
+  if (child != NULL && child->destroy.value == 0)
+    {
+      sema_down (&child->finish);
       exit_status = child->exit_status;
-      remove_process (child);
+      sema_up (&child->destroy);
     }
 
   return exit_status;
@@ -241,16 +229,24 @@ process_exit (void)
   struct thread *cur = thread_current ();
   uint32_t *pd;
 
-  struct process *process = find_process (cur->tid);
-  if (process != NULL)
-    {
-      file_close (process->executable);
-      for (int fd = STDOUT_FILENO + 1; fd < NOFILE; ++fd)
-        file_close (process->open_files[fd]);
+  /* Destroy supplemental page table. */
+  page_table_destroy (&cur->page_table);
 
-      sema_up (&process->running);
+  /* Unmap files*/
+  struct list_elem *cursor = list_begin (&cur->mappings);
+  while (cursor != list_end (&cur->mappings))
+    {
+      struct mapping *m = list_entry (cursor, struct mapping, elem);
+      file_close (m->file);
+      cursor = list_next (cursor);
+      free (m);
     }
-  
+
+  /* Close executable and open files. */
+  file_close (cur->executable);
+  for (int fd = STDOUT_FILENO + 1; fd < NOFILE; ++fd)
+    file_close (cur->open_files[fd]);
+
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
   pd = cur->pagedir;
@@ -266,6 +262,16 @@ process_exit (void)
       cur->pagedir = NULL;
       pagedir_activate (NULL);
       pagedir_destroy (pd);
+    }
+
+  sema_up (&cur->finish);
+
+  /* If thread has parent, wait until the parent reads the child exit code. */
+  if (cur->parent != NULL)
+    {
+      sema_down (&cur->destroy);
+      list_remove (&cur->child_elem);
+      cur->parent = NULL;
     }
 }
 
@@ -376,7 +382,9 @@ load (const char *file_name, void (**eip) (void), void **esp)
   process_activate ();
 
   /* Open executable file. */
+  lock_acquire (&fs_lock);
   file = filesys_open (file_name);
+  lock_release (&fs_lock);
   if (file == NULL) 
     goto done; 
 
@@ -463,7 +471,15 @@ load (const char *file_name, void (**eip) (void), void **esp)
 
  done:
   /* We arrive here whether the load is successful or not. */
-  file_close (file);
+  if (success)
+    t->executable = file;
+  else
+    {
+      lock_acquire (&fs_lock);
+      file_close (file);
+      lock_release (&fs_lock);
+    }
+
   return success;
 }
 
@@ -538,40 +554,32 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
   ASSERT (pg_ofs (upage) == 0);
   ASSERT (ofs % PGSIZE == 0);
 
-  file_seek (file, ofs);
-  while (read_bytes > 0 || zero_bytes > 0) 
+  struct thread *t = thread_current ();
+
+  while (read_bytes > 0 || zero_bytes > 0)
     {
       /* Calculate how to fill this page.
-         We will read PAGE_READ_BYTES bytes from FILE
-         and zero the final PAGE_ZERO_BYTES bytes. */
+        We will read PAGE_READ_BYTES bytes from FILE
+        and zero the final PAGE_ZERO_BYTES bytes. */
       size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;
       size_t page_zero_bytes = PGSIZE - page_read_bytes;
 
-      /* Get a page of memory. */
-      uint8_t *kpage = palloc_get_page (PAL_USER);
-      if (kpage == NULL)
-        return false;
-
-      /* Load this page. */
-      if (file_read (file, kpage, page_read_bytes) != (int) page_read_bytes)
-        {
-          palloc_free_page (kpage);
-          return false; 
-        }
-      memset (kpage + page_read_bytes, 0, page_zero_bytes);
-
-      /* Add the page to the process's address space. */
-      if (!install_page (upage, kpage, writable)) 
-        {
-          palloc_free_page (kpage);
-          return false; 
-        }
-
-      /* Advance. */
+      struct page *p = malloc (sizeof (struct page));
+      p->address = upage;
+      p->segment = SEG_CODE;
+      p->writable = writable;
+      p->file = file;
+      p->position = ofs;
+      p->read_bytes = page_read_bytes;
+      p->zero_bytes = page_zero_bytes;
+      page_table_insert (&t->page_table, p);
+      
       read_bytes -= page_read_bytes;
       zero_bytes -= page_zero_bytes;
       upage += PGSIZE;
+      ofs += page_read_bytes;
     }
+
   return true;
 }
 
@@ -581,16 +589,28 @@ static bool
 setup_stack (void **esp) 
 {
   uint8_t *kpage;
+  uint8_t *upage = ((uint8_t *) PHYS_BASE) - PGSIZE;
   bool success = false;
 
-  kpage = palloc_get_page (PAL_USER | PAL_ZERO);
+  kpage = frame_table_set_frame (upage);
   if (kpage != NULL) 
     {
-      success = install_page (((uint8_t *) PHYS_BASE) - PGSIZE, kpage, true);
+      success = install_page (upage, kpage, true);
       if (success)
-        *esp = USER_STACK;
+        {
+          *esp = USER_STACK;
+
+          struct page *p = malloc (sizeof (struct page));
+          p->address = upage;
+          p->segment = SEG_STACK;
+          p->writable = true;
+          p->file = NULL;
+
+          struct thread *t = thread_current ();
+          page_table_insert (&t->page_table, p);
+        }
       else
-        palloc_free_page (kpage);
+        frame_table_clear_frame (kpage);
     }
   return success;
 }
@@ -611,32 +631,5 @@ install_page (void *upage, void *kpage, bool writable)
 
   /* Verify that there's not already a page at that virtual
      address, then map our page there. */
-  return (pagedir_get_page (t->pagedir, upage) == NULL
-          && pagedir_set_page (t->pagedir, upage, kpage, writable));
-}
-
-struct process *
-process_current (void)
-{
-  return find_process (thread_current ()->tid);
-}
-
-bool
-process_has_child (tid_t tid)
-{
-  struct process *p = find_process (tid);
-  return p != NULL && p->parent == thread_current ()->tid;
-}
-
-static struct process *
-find_process (tid_t tid)
-{
-  for (struct list_elem *cursor = list_begin (&process_list); cursor != list_end (&process_list); cursor = list_next (cursor))
-    {
-      struct process *p = list_entry (cursor, struct process, elem);
-      if (p->tid == tid)
-        return p;
-    }
-  
-  return NULL;
+  return pagedir_get_page (t->pagedir, upage) == NULL && pagedir_set_page (t->pagedir, upage, kpage, writable);
 }

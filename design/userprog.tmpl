@@ -139,6 +139,7 @@ file descriptor로 사용합니다. 그리고 open_files는 프로세스마다 �
 >> (e.g. calls to pagedir_get_page()) that might result?  What about
 >> for a system call that only copies 2 bytes of data?  Is there room
 >> for improvement in these numbers, and how much?
+메모리 복사 방식을 변경 (memcpy: double 또는 simd 구현)
 각 바이트마다 페이지 테이블을 확인해야 되므로 최소 1번에서 최대 4096번까지 페이지 테이블을
 검사해야합니다. 따라서 2바이트만 복사하는 경우에는 검사 횟수가 최대 2번까지로 줄어듭니다.
 (chatgpt 답변 - 질문을 제대로 이해하지 못했습니다.)

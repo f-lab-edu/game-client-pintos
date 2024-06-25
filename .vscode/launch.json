@@ -27,6 +27,18 @@
             "remote": true,
             "cwd": "${workspaceRoot}",
             "gdbpath": "/pintos/src/utils/pintos-gdb"
-        }
+        },
+        {
+          "name": "Attach to Pintos (vm)",
+          "type": "gdb",
+          "request": "attach",
+          // we attach executable on kernel.o for now, but as project goes on, you need to change this properly
+          "executable": "${workspaceFolder}/src/vm/build/kernel.o",
+          // to connect debugpintos, we use port 1234
+          "target": ":1234",
+          "remote": true,
+          "cwd": "${workspaceRoot}",
+          "gdbpath": "/pintos/src/utils/pintos-gdb"
+      }
     ]
 }

@@ -2,6 +2,7 @@
 #define THREADS_THREAD_H
 
 #include <debug.h>
+#include <hash.h>
 #include <list.h>
 #include <stdint.h>
 #include "synch.h"
@@ -26,6 +27,18 @@ typedef int tid_t;
 #define PRI_DEFAULT 31                  /* Default priority. */
 #define PRI_MAX 63                      /* Highest priority. */
 #define PRI_DONATION_MAX 8
+
+#define NOFILE 128
+
+typedef int mapid_t;
+#define MAP_FAILED ((mapid_t) -1)
+
+struct mapping
+  {
+    struct list_elem elem;
+    mapid_t mapid;
+    struct file *file;
+  };
 
 /* A kernel thread or user process.
 
@@ -97,6 +110,23 @@ struct thread
     struct list donation_list;
     struct list_elem donation_elem;
 
+    struct semaphore finish;
+    struct semaphore destroy;
+
+    int exit_status;
+    struct file *executable;
+    struct file *open_files[NOFILE];
+
+    struct thread *parent;
+    struct list child_list;
+    struct list_elem child_elem;
+
+    void *esp;                          /* Saved user stack pointer. */
+    struct hash page_table;
+
+    mapid_t next_mapid;
+    struct list mappings;
+
     struct list_elem allelem;           /* List element for all threads list. */
 
     /* Shared between thread.c and synch.c. */
@@ -115,6 +145,7 @@ struct thread
    If true, use multi-level feedback queue scheduler.
    Controlled by kernel command-line option "-o mlfqs". */
 extern bool thread_mlfqs;
+extern struct lock fs_lock;
 
 void thread_init (void);
 void thread_start (void);
