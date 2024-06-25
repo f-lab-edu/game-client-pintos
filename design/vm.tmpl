@@ -30,24 +30,77 @@ FirstName LastName <email@domain.example>
 >> `struct' member, global or static variable, `typedef', or
 >> enumeration.  Identify the purpose of each in 25 words or less.
 
+/* 페이지 사용 유형 */
+enum segment
+  {
+    SEG_CODE,
+    SEG_STACK,
+    SEG_MAPPING,
+  };
+
+struct page
+  {
+    struct hash_elem elem;
+    void *address;
+    enum segment segment;
+    bool writable;
+    struct file *file;
+    off_t position;
+    uint32_t read_bytes;
+    uint32_t zero_bytes;
+    mapid_t mapid;
+  };
+
+struct frame
+  {
+    struct list_elem elem;
+    struct thread *thread;
+    void *upage;
+    void *kpage;
+  };
+
+static struct list frame_table;
+static struct lock frame_lock;
+
+struct thread
+  {
+    ...
+
+    void *esp;
+    struct hash page_table;
+    ...
+  };
+
 ---- ALGORITHMS ----
 
 >> A2: In a few paragraphs, describe your code for accessing the data
 >> stored in the SPT about a given page.
+1. page fault가 발생하면 해당 주소가 속해있는 page 주소를 찾습니다.
+2. page 주소와 일치하는 supplemental page를 해당 스레드의 SPT에서 찾습니다. 
 
 >> A3: How does your code coordinate accessed and dirty bits between
 >> kernel and user virtual addresses that alias a single frame, or
 >> alternatively how do you avoid the issue?
+page fault가 발생하여 frame이 필요한 경우, frame table에서 사용한 frame을 찾습니다.
+이 과정에서 사용가능한 frame이 존재하지 않는 경우, frame table에 저장된 요소들을
+accessed bit를 사용하여 재배치합니다. (accessed bit가 켜진 경우 앞으로 배치)
+dirty bit는 frame을 swap을 해야하는지 결정할 때 사용합니다.
 
 ---- SYNCHRONIZATION ----
 
 >> A4: When two user processes both need a new frame at the same time,
 >> how are races avoided?
+lock을 사용합니다.
+
 
 ---- RATIONALE ----
 
 >> A5: Why did you choose the data structure(s) that you did for
 >> representing virtual-to-physical mappings?
+frame 구조체를 정의하여 해당 frame을 사용 중인 virtual address와 physical address를 저장하고 관리합니다.
+전역 자료구조이기 때문에 frame을 사용 중인 thread도 같이 저장합니다. virtual address는 스레드마다 고유하지
+않기 때문에 thread id와 virtual address를 같이 사용하여 frame을 관리합니다.
+
 
                PAGING TO AND FROM DISK
                =======================
@@ -58,18 +111,55 @@ FirstName LastName <email@domain.example>
 >> `struct' member, global or static variable, `typedef', or
 >> enumeration.  Identify the purpose of each in 25 words or less.
 
+struct frame
+  {
+    struct list_elem elem;
+    struct thread *thread;
+    void *upage;
+    void *kpage;
+  };
+
+static struct list frame_table;
+static struct list locked_frame_list;
+static struct lock frame_lock;
+
+struct slot
+  {
+    struct list_elem elem;
+    tid_t tid;
+    void *upage;
+    size_t index;
+  };
+
+static struct list swap_table;
+static struct bitmap *slot_map;
+static size_t slot_count;
+
 ---- ALGORITHMS ----
 
 >> B2: When a frame is required but none is free, some frame must be
 >> evicted.  Describe your code for choosing a frame to evict.
+1. frame table을 LRU 방식으로 재배치합니다.
+2. frame table에서 가장 마지막 요소를 선택합니다. (사용한지 가장 오래된 페이지)
+3. 해당 frame을 사용하고 있는 supplemental page를 찾습니다.
+4-1. 해당 page가 code 또는 stack이라면
+4-1-1. frame이 갱신되었다면 swap in을 합니다.
+4-2. 그렇지 않고, mapped page라면
+4-2-1. frame 갱신되었다면 mapping file에 데이터를 씁니다.
+5. 이제 이 frame을 현재 사용하려는 page의 정보로 갱신합니다.
 
 >> B3: When a process P obtains a frame that was previously used by a
 >> process Q, how do you adjust the page table (and any other data
 >> structures) to reflect the frame Q no longer has?
+frame.thread, frame.upage값을 process P의 값으로 변경합니다.
 
 >> B4: Explain your heuristic for deciding whether a page fault for an
 >> invalid virtual address should cause the stack to be extended into
 >> the page that faulted.
+page fault가 발생했을 때, fault address가 stack 범위내에 있는지 검사합니다.
+(현재 할당된 stack뿐만 아니라 최대 stack 범위까지 검사를 합니다.)
+그리고 현재 stack top - 32bit 범위 내에 있는지 검사합니다. (pintos의 특성)
+이 두 조건을 만족할 경우 스택을 확장합니다. 
 
 ---- SYNCHRONIZATION ----
 
@@ -77,22 +167,37 @@ FirstName LastName <email@domain.example>
 >> particular, explain how it prevents deadlock.  (Refer to the
 >> textbook for an explanation of the necessary conditions for
 >> deadlock.)
+저의 구현의 경우, frame table, swap table 전역 변수로 되어있습니다.
+이 중에서 frame table을 사용하는 경우에 lock을 설정해서 race condition을 막습니다.
+swap_table을 lock으로 막지 않은 이유는 swap table을 사용하는 위치가 page fault interrupt와
+frame table 내에서 사용하기 때문입니다.
 
 >> B6: A page fault in process P can cause another process Q's frame
 >> to be evicted.  How do you ensure that Q cannot access or modify
 >> the page during the eviction process?  How do you avoid a race
 >> between P evicting Q's frame and Q faulting the page back in?
+process Q에서 page를 수정 중이었다면, process P가 frame을 얻는 과정에서
+swap 대상에서 제외될 것입니다. 왜냐하면 가장 최근까지 접근했기 때문입니다.
+그리고 process P에서 새로운 frame을 얻을 때, frame table의 가장 앞으로
+이동하기 때문에, process Q로 실행이 와서 다시 frame을 획득할 때는 process P의
+frame을 얻을 가능성이 적습니다. (제 구현에서는 frame table에서 가장 마지막 frame
+을 가져옵니다.)
 
 >> B7: Suppose a page fault in process P causes a page to be read from
 >> the file system or swap.  How do you ensure that a second process Q
 >> cannot interfere by e.g. attempting to evict the frame while it is
 >> still being read in?
+swap을 하거나 디스크에서 읽고 쓰는 경우에는 해당 frame을 locked_frame_list로 이동시킵니다.
+그러면 page fault가 발생해서 frame을 선택해야하는 상황이 올 경우, locked_frame_list에 있는
+frame들은 선택에서 제외됩니다. 작업이 완료되면 다시 frame_table로 이동시킵니다.
 
 >> B8: Explain how you handle access to paged-out pages that occur
 >> during system calls.  Do you use page faults to bring in pages (as
 >> in user programs), or do you have a mechanism for "locking" frames
 >> into physical memory, or do you use some other design?  How do you
 >> gracefully handle attempted accesses to invalid virtual addresses?
+page fault interrupt를 사용합니다. user process마다 supplemental page table이 있어서
+fault address가 속해 있는 page를 supplemental page table에 있는지 찾습니다.
 
 ---- RATIONALE ----
 
@@ -102,6 +207,11 @@ FirstName LastName <email@domain.example>
 >> possibility for deadlock but allows for high parallelism.  Explain
 >> where your design falls along this continuum and why you chose to
 >> design it this way.
+저는 frame table에서 하나의 lock을 사용하도록 했습니다. swap table의 경우에는
+frame table와 page fault interrupt에서 사용하기 때문에 따로 lock을 구현하지 않았습니다.
+하지만 pintos가 multi-core system에서 작동할 경우 page fault interrupt에서
+context switching이 발생할 수 있고, 여기서 swap table에 대해 race condition이 발생할 수
+있으므로 swap table에서 대해서도 lock을 사용해야할 것 같습니다.
 
              MEMORY MAPPED FILES
              ===================
@@ -112,14 +222,38 @@ FirstName LastName <email@domain.example>
 >> `struct' member, global or static variable, `typedef', or
 >> enumeration.  Identify the purpose of each in 25 words or less.
 
+typedef int mapid_t;
+#define MAP_FAILED ((mapid_t) -1)
+
+struct mapping
+  {
+    struct list_elem elem;
+    mapid_t mapid;
+    struct file *file;
+  };
+
+struct thread
+  {
+    ...
+    mapid_t next_mapid;
+    struct list mappings;
+    ...
+  };
 ---- ALGORITHMS ----
 
 >> C2: Describe how memory mapped files integrate into your virtual
 >> memory subsystem.  Explain how the page fault and eviction
 >> processes differ between swap pages and other pages.
+mmap system call이 오면 mapping data를 해당 스레드에 저장합니다.
+그리고 supplemental page를 생성합니다. 이때 파일 포인터, 접근 위치 등
+파일을 읽을 때 필요한 정보를 저장합니다. 이후에 page fault가 발생하면
+연결된 파일로부터 데이터를 읽습니다.
+
 
 >> C3: Explain how you determine whether a new file mapping overlaps
 >> any existing segment.
+사용자가 요청한 주소를 supplemental page table로 조회하여 이미 생성된 page가
+있는지 확인합니다. 있다면 mapping을 진행하지 않고 종료합니다.
 
 ---- RATIONALE ----
 
@@ -129,6 +263,8 @@ FirstName LastName <email@domain.example>
 >> that much of their implementation can be shared.  Explain why your
 >> implementation either does or does not share much of the code for
 >> the two situations.
+맞습니다. 그래서 저도 page fault가 발생했을 때, mapped file과 executable file의 경우
+같은 방식으로 처리하고 있습니다.
 
                SURVEY QUESTIONS
                ================
