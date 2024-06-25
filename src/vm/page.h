@@ -2,12 +2,14 @@
 #define VM_PAGE_H
 
 #include "hash.h"
+#include "threads/thread.h"
 #include "filesys/off_t.h"
 
 enum segment
   {
     SEG_CODE,
     SEG_STACK,
+    SEG_MAPPING,
   };
 
 struct page
@@ -16,7 +18,11 @@ struct page
     void *address;
     enum segment segment;
     bool writable;
+    struct file *file;
     off_t position;
+    uint32_t read_bytes;
+    uint32_t zero_bytes;
+    mapid_t mapid;
   };
 
 void page_table_init (struct hash *page_table);

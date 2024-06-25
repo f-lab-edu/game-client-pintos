@@ -10,6 +10,7 @@
 #include "threads/malloc.h"
 #include "vm/page.h"
 #include "vm/frame.h"
+#include "vm/swap.h"
 #include "filesys/filesys.h"
 #include "pagedir.h"
 
@@ -160,15 +161,15 @@ page_fault (struct intr_frame *f)
   user = (f->error_code & PF_U) != 0;
   
   struct thread *t = thread_current ();
-  void *page_address = pg_round_down (fault_addr);
-  struct page *p = page_table_lookup (&t->page_table, page_address);
+  void *upage = pg_round_down (fault_addr);
+  struct page *p = page_table_lookup (&t->page_table, upage);
 
   if (p == NULL)
     {
       void *limit = t->esp - 32;
       /* Check if the address is a user stack.  */
-      if (within_user_stack (fault_addr) && fault_addr > limit)
-        grow_user_stack (t, page_address);
+      if (within_user_stack (fault_addr) && fault_addr >= limit)
+        grow_user_stack (t, upage);
       else
         exit (-1);
     }
@@ -177,42 +178,48 @@ page_fault (struct intr_frame *f)
       switch (p->segment)
         {
           case SEG_CODE:
+          case SEG_MAPPING:
             {
-              void *frame = frame_table_get_frame ();
+              void *kpage = frame_table_set_frame (upage);
 
-              struct file *file = filesys_open (t->name);
-              off_t length = file_length (file);
-              size_t page_read_bytes = p->position + PGSIZE < file_length (file) ? PGSIZE : length - p->position;
-              size_t page_zero_bytes = PGSIZE - page_read_bytes;
+              frame_table_lock_frame (kpage);
 
-              bool success = true;
-
-              if (page_zero_bytes != PGSIZE)
+              if (p->writable && swap_table_is_swapped (t->tid, upage))
+                swap_table_swap_out (t->tid, upage, kpage, p->position);
+              else 
                 {
-                  file_seek (file, p->position);
-
-                  if (file_read (file, frame, page_read_bytes) != (int) page_read_bytes ||
-                      !pagedir_set_page (t->pagedir, p->address, frame, p->writable))
+                  if (p->read_bytes > 0)
+                    {
+                      file_seek (p->file, p->position);
+                      if (file_read (p->file, kpage, p->read_bytes) != (int) p->read_bytes)
                         {
-                          printf ("code loading failed...\n");
-                          success = false;
+                          frame_table_clear_frame (kpage);
+                          exit (-1);
                         }
-
-                  file_close (file);
+                    }
+                  memset (kpage + p->read_bytes, 0, p->zero_bytes);
                 }
 
-              memset (frame + page_read_bytes, 0, page_zero_bytes);
-
-              if (!success)
+              if (pagedir_get_page (t->pagedir, p->address) || !pagedir_set_page (t->pagedir, p->address, kpage, p->writable))
                 {
-                  frame_table_free_frame (frame);
+                  frame_table_clear_frame (kpage);
                   exit (-1);
                 }
+
+              frame_table_unlock_frame (kpage);
             }
             break;
           case SEG_STACK:
             {
-              /* TODO: Swap in */
+              void *kpage = frame_table_set_frame (upage);
+              frame_table_lock_frame (kpage);
+              swap_table_swap_out (thread_current ()->tid, upage, kpage, p->position);
+              if (!pagedir_set_page (t->pagedir, upage, kpage, true))
+                {
+                  frame_table_clear_frame (kpage);
+                  exit (-1);
+                }
+              frame_table_unlock_frame (kpage);
             }
             break;
         }
@@ -222,28 +229,30 @@ page_fault (struct intr_frame *f)
 static bool
 within_user_stack (void *address)
 {
+  void *high = PHYS_BASE;
+  void *low = PHYS_BASE - STACK_MAX_SIZE;
   return address < PHYS_BASE && address >= PHYS_BASE - STACK_MAX_SIZE;
 }
 
 static void
-grow_user_stack (struct thread *t, void *virtual_address)
+grow_user_stack (struct thread *t, void *upage)
 {
-  while (pagedir_get_page (t->pagedir, virtual_address) == NULL)
+  while (pagedir_get_page (t->pagedir, upage) == NULL)
     {
-      void *frame = frame_table_get_frame ();
-      bool success = pagedir_set_page (t->pagedir, virtual_address, frame, true);
+      void *kpage = frame_table_set_frame (upage);
+      bool success = pagedir_set_page (t->pagedir, upage, kpage, true);
       if (success)
         {
-          struct page p;
-          p.address = virtual_address;
-          p.segment = SEG_STACK;
-          p.writable = true;
-          page_table_insert (&t->page_table, &p);
-          virtual_address += PGSIZE;
+          struct page *p = malloc (sizeof (struct page));
+          p->address = upage;
+          p->segment = SEG_STACK;
+          p->writable = true;
+          page_table_insert (&t->page_table, p);
+          upage += PGSIZE;
         }
       else
         {
-          frame_table_free_frame (frame);
+          frame_table_clear_frame (kpage);
           exit (-1);
         }
     }
