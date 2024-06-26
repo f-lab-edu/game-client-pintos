@@ -1,2 +1,2 @@
-# CSCC69-Pintos
-
+### 소개
+UTSC Pintos Project
